@@ -152,7 +152,7 @@ For each of the 3 candidates:
 1. Copy a top-performing base harness to `reward_harness/agents/<name>.py`, then make targeted modifications. This copy-then-edit approach ensures correct imports and proven patterns.
 2. Implement the new mechanism according to your hypothesis.
 3. Self-critique (mandatory): After implementing, re-read the file and check: does this harness introduce a genuinely NEW mechanism, or is it just a parameter variant? If the logic in `get_skill_registry()`, `build_rubrics()`, and `judge()` is identical to the base except for constants, REWRITE with a truly novel mechanism.
-4. Validate:
+4. Import/interface check:
 
 ```bash
 python3 -c "from reward_harness.agents.<name> import *; print('OK')"
