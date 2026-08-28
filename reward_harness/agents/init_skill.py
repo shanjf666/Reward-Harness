@@ -1,324 +1,191 @@
-"""使用可自由选择 workflow Skill 的第一版 Reward Harness 候选。"""
+"""使用 G-stage Rubric Skill 生成判别性标准的初始 Harness。"""
 
 from __future__ import annotations
 
 import json
 
 from ..reward_system import (
-    Response,
-    JudgmentResult,
-    RewardResult,
-    RewardSystem,
     Query,
+    Response,
+    RewardSystem,
     RubricSet,
-    Skill,
     SkillRegistry,
+    WinnerResult,
+)
+from ..skill_store import load_skill_registry, render_skill_block
+
+
+HARNESS_NAME = "init_skill"
+INITIAL_SKILLS = (
+    "response_aware_rubric_workflow",
+    "rubric_guided_pairwise_judge",
 )
 
 
-RUBRIC_SKILL_SELECTION_PROMPT = """Select skills for rubric generation.
+RUBRIC_SKILL_PROMPT = """
+You are generating a shared evaluation rubric for a comparative reward model.
+Follow the selected Rubric Skills exactly.
 
-[Public Task]
-{task_json}
+Selected Rubric Skills:
+{skills}
+-----------------END OF THE SKILLS------------------
 
-[Anonymized Response Set]
-{responses_json}
+Public Query:
+{query}
 
-[Available Skills]
-{skill_catalog_json}
+Anonymous Responses:
+{responses}
 
-Select zero or more useful skills. Return JSON only:
-{{"skill_calls": ["skill_name"]}}
-"""
-
-
-RUBRIC_GENERATION_PROMPT = """You are a rubric-generation model.
-
-Generate one shared set of task-specific evaluation rubrics from the public
-query, the anonymized unlabeled response set, and the selected workflow skills.
-Preference labels are unavailable; response order is arbitrary.
-
-[Public Task]
-{task_json}
-
-[Anonymized Response Set]
-{responses_json}
-
-[Selected Workflow Skills]
-{skills_json}
-
-Requirements:
-- Return 2 to 6 non-overlapping rubrics.
-- Compare the responses only to discover substantive quality differences and
-  common omissions; never infer preference from their order.
-- Each rubric must be one atomic, binary-verifiable requirement observable from
-  a single response and answerable only as PASS or FAIL.
-- Make the pass condition concrete and self-contained. State the required fact,
-  reasoning step, constraint, or behavior; avoid vague criteria such as
-  "correct", "clear", or "high quality" without an explicit test.
-- PASS requires full satisfaction of the condition; partial satisfaction is FAIL.
-- Every rubric must remain independently applicable to any single response.
-  Never mention response positions, identifiers, comparisons, winners, or the
-  observed response set in the criterion.
-- Cover indispensable query requirements even when all observed responses miss
-  them, and ignore incidental wording, verbosity, or formatting differences.
-- weight must be a positive number representing the rubric's relative importance.
-- Do not include candidate-specific wording or predicted answers.
-- Return JSON only, with this schema:
+Return one JSON object only:
 {{
   "rubrics": [
     {{
-      "rubric_id": "short_unique_id",
-      "criterion": "PASS if the response ...; otherwise FAIL",
-      "weight": 1.0
+      "rubric_id": "r1",
+      "criterion": "A single atomic and observable requirement"
     }}
   ]
 }}
-"""
+
+The rubric may use the complete response set to discover discriminative criteria,
+but every criterion must remain position-independent and must not reveal or encode
+which response should win.
+""".strip()
 
 
-JUDGE_SKILL_SELECTION_PROMPT = """Select skills for pointwise rubric scoring.
+RUBRIC_JUDGE_PROMPT = """
+You are a fair and impartial judge. Compare Response A and Response B under the
+shared response-aware rubric and select the single response that best satisfies
+the user's instruction. You must select exactly one winner.
 
-[Public Task]
-{task_json}
+Follow the selected Judge Skills exactly.
 
-[Shared Rubrics]
-{rubrics_json}
+Selected Judge Skills:
+{skills}
+-----------------END OF THE SKILLS------------------
 
-[Current Response]
-{candidate_json}
+Evaluate decisive hard failures before softer quality differences. Do not let a
+minor criterion override the user's core intent. Cite concrete evidence from both
+responses and do not reward verbosity.
 
-[Available Skills]
-{skill_catalog_json}
+--- Analysis ---
+<Compare both responses against the relevant rubric criteria>
 
-Select zero or more useful skills. Return JSON only:
-{{"skill_calls": ["skill_name"]}}
-"""
+--- Final Judgment ---
+Aggregation Summary: <the decisive differences>
+Justification: <why those differences determine the result>
+Winner: <Response A / Response B>
 
+Task to Evaluate:
+Instruction:
+{instruction}
 
-RUBRIC_EVALUATION_PROMPT = """You are a pointwise reward judge.
+Rubric:
+{rubric}
 
-Evaluate the single response against the one supplied rubric. Do not compare it
-with another answer and do not infer its position in a preference pair.
-
-[Public Task]
-{task_json}
-
-[Single Rubric]
-{rubrics_json}
-
-[Selected Workflow Skills]
-{skills_json}
-
-[Response]
-{candidate_json}
-
-Requirements:
-- Return exactly one judgment for the supplied rubric_id.
-- score must be the integer 1 when the response fully satisfies the binary pass
-  condition, otherwise 0. Do not award partial credit.
-- Workflow skills are guidance; scores must still be based on the rubrics.
-- evidence must quote or briefly identify observable response content.
-- Return JSON only, with this schema:
-{{
-  "judgments": [
-    {{
-      "rubric_id": "matching rubric id",
-      "score": 0,
-      "evidence": ["short evidence"],
-      "confidence": 0.0
-    }}
-  ]
-}}
-"""
+{response_block}
+""".strip()
 
 
-TASK_OBJECTIVE_SKILL = Skill(
-    name="task_objective",
-    stage="G",
-    description="Clarify the user's objective and observable task success.",
-    content=(
-        "Focus on the user's actual objective, observable correctness, and task "
-        "completion rather than surface style or verbosity."
-    ),
-)
+def _response_block(responses: tuple[Response, ...]) -> str:
+    """把双回答渲染成稳定的 A/B 比较格式。"""
 
-CONSTRAINT_ANALYSIS_SKILL = Skill(
-    name="constraint_analysis",
-    stage="G",
-    description="Identify explicit format, content, and prohibited-behavior constraints.",
-    content=(
-        "Check every explicit requirement independently. Treat requested format and "
-        "prohibited behavior as constraints, without inventing new ones."
-    ),
-)
+    if len(responses) != 2:
+        raise ValueError("init_skill pairwise judging requires exactly 2 responses")
+    return "".join(
+        f"--- Response {label} ---\n"
+        f"{response.content.strip()}\n"
+        f"--- End Response {label} ---\n"
+        for label, response in zip(("A", "B"), responses)
+    )
 
-POINTWISE_EVIDENCE_SKILL = Skill(
-    name="pointwise_evidence",
-    stage="J",
-    description="Ground rubric scoring in observable evidence from one candidate.",
-    content=(
-        "Use criteria that can be checked from one candidate at a time. For each "
-        "criterion, identify observable supporting or contradicting evidence before "
-        "deciding PASS or FAIL."
-    ),
-)
+
+def _winner_result(
+    query: Query,
+    responses: tuple[Response, ...],
+    evaluation: str,
+) -> WinnerResult:
+    """从固定 Final Judgment 区域提取 A/B winner。"""
+
+    prediction = (
+        evaluation.rsplit("Final Decision", 1)[-1]
+        .rsplit("Final Judgment", 1)[-1]
+        .split("Winner", 1)[-1]
+        .split("Response", 1)[-1]
+        .split("Candidate", 1)[-1]
+    )
+    prediction = (
+        prediction.replace("*", "")
+        .replace(":", "")
+        .replace(".", "")
+        .replace(" ", "")
+        .strip()
+    )
+    label = prediction[0].upper() if prediction else ""
+    if label not in {"A", "B"}:
+        raise ValueError("init_skill judge must declare Winner: Response A/B")
+    return WinnerResult(
+        query_id=query.query_id,
+        winner_response_id=responses[ord(label) - ord("A")].response_id,
+        metadata={
+            "winner_label": label,
+            "comparison": "pairwise_forced_choice",
+            "method": "init_skill",
+        },
+    )
 
 
 class InitSkillHarness(RewardSystem):
-    """模型可从 Skill Registry 中独立选择零个或多个 Skill。"""
+    """用固定 G-stage Skill 生成 Rubrics，再执行 rubric-guided Judge。"""
 
-    rubric_skill_selection_prompt = RUBRIC_SKILL_SELECTION_PROMPT
-    rubric_prompt_template = RUBRIC_GENERATION_PROMPT
-    judge_skill_selection_prompt = JUDGE_SKILL_SELECTION_PROMPT
-    judge_prompt_template = RUBRIC_EVALUATION_PROMPT
+    rubric_prompt_template = RUBRIC_SKILL_PROMPT
+    judge_prompt_template = RUBRIC_JUDGE_PROMPT
 
     def get_skill_registry(self, task: Query) -> SkillRegistry:
-        """候选可以自由增加、删除或重命名这里注册的 workflow Skill。"""
-
-        return SkillRegistry(
-            (
-                TASK_OBJECTIVE_SKILL,
-                CONSTRAINT_ANALYSIS_SKILL,
-                POINTWISE_EVIDENCE_SKILL,
-            )
-        )
-
-    def aggregate(
-        self,
-        task: Query,
-        candidate: Response,
-        rubrics: RubricSet,
-        judgment_result: JudgmentResult,
-    ) -> RewardResult:
-        """A：按 Rubric 权重聚合二值 Judgment。"""
-
-        judgments = judgment_result.judgments
-        if not judgments:
-            raise ValueError("cannot aggregate an empty judgment set")
-        for judgment in judgments:
-            if not isinstance(judgment.score, int) or judgment.score not in {0, 1}:
-                raise ValueError("init_skill expects binary integer scores 0 or 1")
-
-        judgment_by_id = {judgment.rubric_id: judgment for judgment in judgments}
-        total_weight = sum(rubric.weight for rubric in rubrics.rubrics)
-        weighted_score = sum(
-            rubric.weight * judgment_by_id[rubric.rubric_id].score
-            for rubric in rubrics.rubrics
-        )
-        reward = weighted_score / total_weight
-        return RewardResult(
-            query_id=task.query_id,
-            response_id=candidate.response_id,
-            reward=reward,
-            metadata={"aggregation": "weighted_binary_mean"},
-        )
+        del task
+        return load_skill_registry(INITIAL_SKILLS)
 
     def build_rubrics(
         self,
         task: Query,
         responses: tuple[Response, ...],
     ) -> RubricSet:
-        """由 Rubric Model 选择 Skill，再生成共享 RubricSet。"""
-
-        registry = self.get_skill_registry(task).for_stage("G")
-        task_payload = self._task_payload(task)
-        responses_payload = self._responses_payload(responses)
-        selection_prompt = self.rubric_skill_selection_prompt.format(
-            task_json=json.dumps(task_payload, ensure_ascii=False, indent=2),
-            responses_json=json.dumps(
-                responses_payload, ensure_ascii=False, indent=2
-            ),
-            skill_catalog_json=json.dumps(
-                registry.catalog, ensure_ascii=False, indent=2
-            ),
-        )
-        raw_selection = self.rubric_llm(selection_prompt)
-        skill_calls = self._parse_skill_calls(raw_selection, registry)
-        selected_skills = registry.select(skill_calls)
-
+        selected_skills = self.retrieve_skills(task, responses, "G")
         prompt = self.rubric_prompt_template.format(
-            task_json=json.dumps(task_payload, ensure_ascii=False, indent=2),
-            responses_json=json.dumps(
-                responses_payload, ensure_ascii=False, indent=2
+            skills=render_skill_block(selected_skills),
+            query=json.dumps(
+                self._task_payload(task), ensure_ascii=False, indent=2
             ),
-            skills_json=json.dumps(
-                self._skills_payload(selected_skills),
-                ensure_ascii=False,
-                indent=2,
+            responses=json.dumps(
+                self._responses_payload(responses), ensure_ascii=False, indent=2
             ),
         )
-        raw_response = self.rubric_llm(prompt)
-        rubrics = self._parse_rubrics(raw_response)
-
+        rubrics = self._parse_rubrics(self.rubric_llm(prompt))
         return RubricSet(
             query_id=task.query_id,
             rubrics=rubrics,
             metadata={
-                "selected_skills": list(skill_calls),
-                "skills": self._skills_payload(selected_skills),
+                "method": "init_skill",
+                "online_rubric_generation": True,
+                "skills": [skill.name for skill in selected_skills],
             },
         )
 
-    def score(
+    def judge(
         self,
         task: Query,
-        candidate: Response,
+        responses: tuple[Response, ...],
         rubrics: RubricSet,
-    ) -> JudgmentResult:
-        """由 Reward Model 选择 Skill，再依据共享 Rubric 为单个候选评分。"""
-
-        registry = self.get_skill_registry(task).for_stage("J")
-        task_payload = self._task_payload(task)
-        rubrics_payload = self._rubrics_payload(rubrics)
-        candidate_payload = self._candidate_payload(candidate)
-        selection_prompt = self.judge_skill_selection_prompt.format(
-            task_json=json.dumps(task_payload, ensure_ascii=False, indent=2),
-            rubrics_json=json.dumps(rubrics_payload, ensure_ascii=False, indent=2),
-            candidate_json=json.dumps(candidate_payload, ensure_ascii=False, indent=2),
-            skill_catalog_json=json.dumps(
-                registry.catalog, ensure_ascii=False, indent=2
+    ) -> WinnerResult:
+        selected_skills = self.retrieve_skills(task, responses, "J")
+        prompt = self.judge_prompt_template.format(
+            skills=render_skill_block(selected_skills),
+            instruction=task.instruction,
+            rubric=json.dumps(
+                self._rubrics_payload(rubrics), ensure_ascii=False, indent=2
             ),
+            response_block=_response_block(responses),
         )
-        raw_selection = self.judge_llm(selection_prompt)
-        skill_calls = self._parse_skill_calls(raw_selection, registry)
-        selected_skills = registry.select(skill_calls)
+        return _winner_result(task, responses, self.judge_llm(prompt))
 
-        judgments = []
-        for rubric in rubrics.rubrics:
-            single_rubric_set = RubricSet(
-                query_id=rubrics.query_id,
-                rubrics=(rubric,),
-            )
-            prompt = self.judge_prompt_template.format(
-                task_json=json.dumps(task_payload, ensure_ascii=False, indent=2),
-                rubrics_json=json.dumps(
-                    self._rubrics_payload(single_rubric_set),
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                skills_json=json.dumps(
-                    self._skills_payload(selected_skills),
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                candidate_json=json.dumps(
-                    candidate_payload, ensure_ascii=False, indent=2
-                ),
-            )
-            raw_response = self.judge_llm(prompt)
-            judgments.extend(
-                self._parse_judgments(raw_response, single_rubric_set)
-            )
 
-        return JudgmentResult(
-            query_id=task.query_id,
-            response_id=candidate.response_id,
-            judgments=tuple(judgments),
-            metadata={
-                "selected_skills": list(skill_calls),
-                "skills": self._skills_payload(selected_skills),
-                "grading": "independent_per_rubric",
-                "score_scale": "binary",
-            },
-        )
+HARNESS_CLASS = InitSkillHarness

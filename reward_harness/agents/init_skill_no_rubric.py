@@ -1,4 +1,4 @@
-"""Eval-Skill 官方 vanilla pairwise judging Harness。"""
+"""只在 Judge 阶段注入 Skill、但不生成 Rubric 的初始 Harness。"""
 
 from __future__ import annotations
 
@@ -10,28 +10,28 @@ from ..reward_system import (
     SkillRegistry,
     WinnerResult,
 )
+from ..skill_store import load_skill_registry, render_skill_block
 
 
-HARNESS_NAME = "no_rubric"
+HARNESS_NAME = "init_skill_no_rubric"
+INITIAL_SKILLS = ("pairwise_evaluation_workflow",)
 
 
-VANILLA_PAIRWISE_JUDGE_PROMPT = """
-You are a fair and impartial judge. Your task is to evaluate 'Response A' and 'Response B' based on a given instruction to select the single best response. You will conduct this evaluation in distinct phases as outlined below.
-
-### Phase 1: Analyze Each Response
-Analyze each response individually against the user instruction. Think step-by-step about the strengths and weaknesses of each response, considering factors such as helpfulness, clarity, accuracy, formatting, and adherence to the user's explicit and implicit constraints. Provide a concise justification for your findings for each response.
-
-### Phase 2: Final Judgment Instructions
-Based on the results from the previous phase, determine the overall winner. Provide a final justification explaining your decision first, and then give your final decision. Consider which response best meets the user's needs with the fewest flaws.
-Think step-by-step to aggregate the findings and make the decision; keep the reasoning explicit and concise.
+SKILL_PAIRWISE_JUDGE_PROMPT = """
+You are a fair and impartial judge. Your task is to evaluate 'Response A' and 'Response B' based on a given instruction to select the single best response.
 **NOTE**: You must select a winner. Never respond with "None" or "Neither" as the winner.
 
+You may use the selected Judge Skills derived from other successful examples, as references if helpful.
+
+Selected Judge Skills:
+{skills}
+-----------------END OF THE SKILLS------------------
+
 ### REQUIRED OUTPUT FORMAT
-You must follow this exact output format below.
+You must follow this exact output format below. Conduct your detailed analysis in the `Analysis` section, following the exact structure, workflow, and instructions defined in the **Skill**, and finally give your decision in the `Final Judgment` section.
 
 --- Analysis ---
-**Response A:** Justification: <...>
-**Response B:** Justification: <...>
+<Conduct your detailed analysis following the exact workflow and instructions defined in the Skill>
 
 --- Final Judgment ---
 Aggregation Summary: <1-3 sentences explaining why the winning response was chosen over the other>
@@ -85,16 +85,19 @@ def _winner_result(
         metadata={
             "winner_label": label,
             "comparison": "pairwise_forced_choice",
-            "method": "no_rubric",
+            "method": "init_skill_no_rubric",
         },
     )
 
 
-class NoRubricHarness(RewardSystem):
-    judge_prompt_template = VANILLA_PAIRWISE_JUDGE_PROMPT
+class InitSkillNoRubricHarness(RewardSystem):
+    """把可由 Harness Optimization 编辑的离线 Skill 注入官方 Judge Prompt。"""
+
+    judge_prompt_template = SKILL_PAIRWISE_JUDGE_PROMPT
 
     def get_skill_registry(self, task: Query) -> SkillRegistry:
-        return SkillRegistry()
+        del task
+        return load_skill_registry(INITIAL_SKILLS)
 
     def build_rubrics(
         self, task: Query, responses: tuple[Response, ...]
@@ -102,7 +105,14 @@ class NoRubricHarness(RewardSystem):
         return RubricSet(
             query_id=task.query_id,
             rubrics=(),
-            metadata={"method": "no_rubric"},
+            metadata={
+                "method": "init_skill_no_rubric",
+                "online_rubric_generation": False,
+                "skills": [
+                    skill.name
+                    for skill in self.retrieve_skills(task, responses, "J")
+                ],
+            },
         )
 
     def judge(
@@ -111,8 +121,10 @@ class NoRubricHarness(RewardSystem):
         responses: tuple[Response, ...],
         rubrics: RubricSet,
     ) -> WinnerResult:
+        selected_skills = self.retrieve_skills(task, responses, "J")
         prompt = self.judge_prompt_template.format(
             instruction=task.instruction,
+            skills=render_skill_block(selected_skills),
             response_block=_response_block(responses),
         )
         return _winner_result(
@@ -122,4 +134,4 @@ class NoRubricHarness(RewardSystem):
         )
 
 
-HARNESS_CLASS = NoRubricHarness
+HARNESS_CLASS = InitSkillNoRubricHarness
